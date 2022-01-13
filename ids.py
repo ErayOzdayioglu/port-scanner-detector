@@ -1,10 +1,9 @@
 import socket
 import struct
-import threading
-import concurrent.futures
 import time
+import logging
 
-closed_ports = {}
+closed_ports = set()
 ips_and_ports = []
 
 def ethernet_head(raw_data):
@@ -13,26 +12,25 @@ def ethernet_head(raw_data):
     data = raw_data[14:]
     return proto, data 
 
-def find_closed_ports(port):
+def find_closed_ports():
     
-      
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
-    result = sock.connect_ex(("127.0.0.1", port))
-    if result != 0:
-        closed_ports.add(port)
-    sock.close()
+    for port in range(1,65535):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        result = sock.connect_ex(("127.0.0.1", port))
+        if result != 0:
+            closed_ports.add(port)
+        sock.close()
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-    for port in range(1000):
-        executor.submit(find_closed_ports,port)
 
 
 def get_ip(addr):
      return '.'.join(map(str, addr))
 
 def syn_to_non_listening_port(ip):
-    print("IP Address: " + ip + " Signature: SYN to non-listening port")
+    logging.basicConfig(filename='ids.log',level=logging.DEBUG)
+    logging.warning('IP Address: %s Signature: SYN to non-listening port',ip)
+   
 
 def check_is_closed(port):
     return port in closed_ports
@@ -40,10 +38,11 @@ def check_is_closed(port):
 def check_is_encountered(item):
     for x in ips_and_ports:
         if (item["ip"] == x["ip"] and item["destination_port"] != x["destination_port"] and (item["time"] - x["time"]) < 180):
-            print("IP Address: " + item["ip"] + " Signature: signature 2")
-            return False
+            logging.basicConfig(filename='ids.log',level=logging.DEBUG)
+            logging.warning('IP Address %s Signature: Several packets from same source to different ports in short amount of time',item["ip"])
+            return True
     ips_and_ports.append(item)
-    return True
+    return False
 
 
 
@@ -56,6 +55,21 @@ def ipv4_head(raw_data):
     target = get_ip(target)
     data = raw_data[header_length:]
     return version, header_length, ttl, proto, src, target, data
+
+def find_local_ip():
+    
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+    
 
 def tcp_head( raw_data):
     (src_port, dest_port, sequence, acknowledgment, offset_reserved_flags) = struct.unpack('! H H L L H', raw_data[:14])
@@ -70,30 +84,31 @@ def tcp_head( raw_data):
     return src_port, dest_port, sequence, acknowledgment, flag_urg, flag_ack,flag_psh, flag_rst, flag_syn, flag_fin, data
 
 def main():
+    find_closed_ports()
     
+    s = socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.ntohs(3))
     
+    local_ip = find_local_ip()
     
     while True:
         raw_data, addr = s.recvfrom(65535)
         eth = ethernet_head(raw_data)
+
         if (eth[0] == 8):
             ipv4 = ipv4_head(eth[1])
-            print( '\t - ' + 'IPv4 Packet:')
-            print('\t\t - ' + 'Version: {}, Header Length: {}, TTL:{},'.format(ipv4[0], ipv4[1], ipv4[2]))
-            print('\t\t - ' + 'Protocol: {}, Source: {}, Target:{}'.format(ipv4[3], ipv4[4], ipv4[5]))
-            if (ipv4[3] == 6):
+            protocol = ipv4[3]
+            source_ip = ipv4[4]
+            target_ip = ipv4[5] 
+            if (protocol == 6 and target_ip == local_ip):
                 tcp = tcp_head(ipv4[6])
-                print('TCP Segment:')
-                print('Source Port: {}, Destination Port: {}'.format(tcp[0], tcp[1]))
-                print('Sequence: {}, Acknowledgment: {}'.format(tcp[2], tcp[3]))
-                print('Flags:')
-                print('URG: {}, ACK: {}, PSH:{}'.format(tcp[4], tcp[5], tcp[6]))
-                print('RST: {}, SYN: {}, FIN:{}'.format(tcp[7], tcp[8], tcp[9]))
+            
+                destination_port = tcp[1]
                 item = {
-                    "ip" : ipv4[4],
-                    "destination_port" : tcp[1],
+                    "ip" : source_ip,
+                    "destination_port" : destination_port,
                     "time" : time.time()
                 }
+             
                 check_is_encountered(item)
                 if(check_is_closed(tcp[1]) and tcp[8] == 1 ):
                     syn_to_non_listening_port(ipv4[4])
